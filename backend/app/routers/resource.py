@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
@@ -14,11 +15,82 @@ from app.services import service_for
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
 
+class ComparableAggregatePayload(BaseModel):
+    """日粒度可比聚合的重算请求：事实行 + 可选的立方容量上限。"""
+    facts: list[dict[str, Any]] = Field(default_factory=list)
+    capacity_limit: int | None = None
+
+
+class MetricQueryPayload(BaseModel):
+    metric_code: str
+    cube_id: int
+    start_date: str
+    end_date: str
+
+
 def require_service(module: str):
     service = service_for(module)
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+# ---- 跨日去重设备数：可比聚合与指标查询（固定路径需先于通用资源路由注册） ----
+
+@router.post("/metric_def/query")
+def query_metric(payload: MetricQueryPayload) -> dict[str, Any]:
+    """指标查询接口：单日返回日值，日期范围返回跨日去重后的总值。"""
+    service = require_service("metric_def")
+    return service.query_metric(
+        payload.metric_code, payload.cube_id, payload.start_date, payload.end_date,
+    )
+
+
+@router.post("/cube_builder/{cube_id}/comparable-aggregates")
+def build_comparable_aggregates(
+    cube_id: int, payload: ComparableAggregatePayload,
+) -> dict[str, Any]:
+    """构建/重算日粒度可比聚合，并登记本次重算可用的事实覆盖。"""
+    service = require_service("cube_builder")
+    return service.build_comparable_aggregates(
+        cube_id, payload.facts, capacity_limit=payload.capacity_limit,
+    )
+
+
+@router.get("/cube_builder/{cube_id}/comparable-partitions")
+def list_comparable_partitions(cube_id: int) -> dict[str, Any]:
+    service = require_service("cube_builder")
+    partitions = service.list_comparable_partitions(cube_id)
+    return {"ok": True, "cube_id": cube_id, "partitions": partitions}
+
+
+@router.get("/cube_builder/{cube_id}/device-range")
+def resolve_device_range(
+    cube_id: int, start_date: str, end_date: str,
+) -> dict[str, Any]:
+    """跨日设备并集：返回精确值或拒绝发布的诊断与各日贡献。"""
+    service = require_service("cube_builder")
+    return service.resolve_device_range(cube_id, start_date, end_date)
+
+
+@router.delete("/cube_builder/{cube_id}/partitions/{date}")
+def remove_day_partition(cube_id: int, date: str) -> dict[str, Any]:
+    """移除某日事实分区，返回移除后的可用来源与覆盖范围。"""
+    service = require_service("cube_builder")
+    return service.remove_day_partition(cube_id, date)
+
+
+@router.get("/metric_def/distinct-metrics/{metric_code}")
+def get_distinct_metric(metric_code: str) -> dict[str, Any]:
+    """查询指标的日粒度去重身份（与立方共用粒度标识）。"""
+    service = require_service("metric_def")
+    identity = service.get_distinct_metric(metric_code)
+    if identity is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"指标 {metric_code} 不是日粒度、不可累加的独立设备数口径",
+        )
+    return {"ok": True, "metric": identity}
 
 
 @router.get("/{module}", response_model=PageResult[dict])

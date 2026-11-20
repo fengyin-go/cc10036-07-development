@@ -59,3 +59,45 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+// ---- 跨日去重设备数 ----
+
+export async function loadDeviceDedupDemo(capacityLimit: number): Promise<Record<string, unknown>> {
+  const response = await request(`/api/analytics/device-dedup/demo?capacity_limit=${capacityLimit}`)
+  if (!response.ok) throw new Error('跨日去重样本读取失败')
+  return await response.json()
+}
+
+export async function queryMetricDays(
+  metricCode: string,
+  cubeId: number,
+  startDate: string,
+  endDate: string,
+): Promise<Record<string, unknown>> {
+  const response = await request('/api/metric_def/query', {
+    method: 'POST',
+    body: JSON.stringify({
+      metric_code: metricCode,
+      cube_id: cubeId,
+      start_date: startDate,
+      end_date: endDate,
+    }),
+  })
+  return await response.json()
+}
+
+export async function removeDayPartition(
+  cubeId: number,
+  date: string,
+): Promise<Record<string, unknown>> {
+  const response = await request(`/api/cube_builder/${cubeId}/partitions/${date}`, {
+    method: 'DELETE',
+  })
+  return await response.json()
+}
+
+export async function listComparablePartitions(cubeId: number): Promise<Record<string, unknown>> {
+  const response = await request(`/api/cube_builder/${cubeId}/comparable-partitions`)
+  if (!response.ok) throw new Error('可比聚合分区读取失败')
+  return await response.json()
+}

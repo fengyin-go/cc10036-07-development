@@ -77,5 +77,35 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 跨日去重设备数
+
+日级立方只保存"当日去重设备数"，直接把多天计数相加会把跨日访问的同一设备
+重复计入。为此，日粒度立方额外保留一份**带来源粒度的可比聚合**：
+
+- 立方的预聚合里保存当日去重后的设备标识（`backend/app/analytics_engine.py`
+  的 `build_comparable_day_aggregates`），日计数始终由完整事实分区得到；
+- 设备标识产物受立方容量上限约束，超出即截断；截断分区的单日计数仍然精确，
+  但不能再参与跨日精确并集；
+- 范围查询对区间内各日分区的标识做并集去重，并逐个列出各日贡献
+  （日值、独有设备、与其他日共用设备）；
+- 指标定义与立方共用日粒度标识（`resolve_grain_id`）。指标查询接口
+  `POST /api/metric_def/query` 单日返回日值，日期范围返回跨日去重后的总值；
+  只有全部日分区可用且产物未截断时才发布精确值，否则 `value` 为空并给出
+  缺失分区/截断分区的诊断。日值相加的结果永远标记为不可累加、不发布。
+
+相关接口：
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/metric_def/query` | 单日返回日值，范围返回去重总值 |
+| `POST /api/cube_builder/{id}/comparable-aggregates` | 重算可比聚合并记录可用事实覆盖 |
+| `GET /api/cube_builder/{id}/comparable-partitions` | 查看各日分区产物与截断情况 |
+| `GET /api/cube_builder/{id}/device-range` | 跨日并集/拒绝发布的诊断与各日贡献 |
+| `DELETE /api/cube_builder/{id}/partitions/{date}` | 移除日事实分区并核对剩余来源 |
+| `GET /api/analytics/device-dedup/demo` | 先看两天日值，再看含重访设备的合计 |
+
+`多维立方`页面上有对应的"跨日去重设备数"面板，可重算样本、查看范围核验和
+移除某个日分区后核对覆盖。测试：`cd backend && .venv/bin/python -m unittest discover -s tests`。
+
 领域：数据工程
 子方向：数据分析与数据应用

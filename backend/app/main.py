@@ -279,6 +279,69 @@ def cache_stats() -> dict[str, Any]:
     return svc.cache_stats()
 
 
+@app.get("/api/analytics/device-dedup/demo")
+def device_dedup_demo(capacity_limit: int = 12) -> dict[str, Any]:
+    """跨日去重设备数演示：先看两天日值，再看含重访设备的合计。
+
+    返回顺序刻意先给日值再给范围值，范围值只有在所有日分区可用且
+    精确去重产物未截断时才是精确值；日值相加的结果单独标注为不可累加。
+    """
+    metric_svc = service_for("metric_def")
+    cube_svc = service_for("cube_builder")
+    if metric_svc is None or cube_svc is None:
+        return {"ok": False, "message": "依赖服务未就绪"}
+
+    cube_id = 1  # 用户行为分析立方，日级分区
+    facts = _sample_device_facts()
+    build = cube_svc.build_comparable_aggregates(
+        cube_id, facts, capacity_limit=capacity_limit,
+    )
+    if not build.get("ok"):
+        return build
+
+    day_one = metric_svc.query_metric("DAU", cube_id, "2026-11-01", "2026-11-01")
+    day_two = metric_svc.query_metric("DAU", cube_id, "2026-11-02", "2026-11-02")
+    both_days = metric_svc.query_metric("DAU", cube_id, "2026-11-01", "2026-11-02")
+
+    naive_sum = (day_one.get("value") or 0) + (day_two.get("value") or 0)
+    return {
+        "ok": True,
+        "metric_code": "DAU",
+        "cube_id": cube_id,
+        "capacity_limit": capacity_limit,
+        "day_queries": [day_one, day_two],
+        "range_query": both_days,
+        "naive_sum_of_days": naive_sum,
+        "naive_sum_publishable": False,
+        "sample": {
+            "fact_rows": len(facts),
+            "dates": build["partitions"],
+            "fact_coverage": build["fact_coverage"],
+        },
+    }
+
+
+@app.get("/api/analytics/device-dedup/coverage")
+def device_dedup_coverage(
+    cube_id: int = 1, start_date: str = "2026-11-01", end_date: str = "2026-11-03",
+) -> dict[str, Any]:
+    """重算后的可用事实覆盖：先把样本聚合进立方，再报告区间覆盖与范围查询结论。"""
+    metric_svc = service_for("metric_def")
+    cube_svc = service_for("cube_builder")
+    if metric_svc is None or cube_svc is None:
+        return {"ok": False, "message": "依赖服务未就绪"}
+    build = cube_svc.build_comparable_aggregates(cube_id, _sample_device_facts())
+    if not build.get("ok"):
+        return build
+    return {
+        "ok": True,
+        "recompute": build,
+        "range_query": metric_svc.query_metric(
+            "DAU", cube_id, start_date, end_date,
+        ),
+    }
+
+
 @app.get("/api/analytics/scheduler/topology")
 def scheduler_topology() -> dict[str, Any]:
     """调度依赖拓扑排序。"""
@@ -289,6 +352,39 @@ def scheduler_topology() -> dict[str, Any]:
 
 
 # ---- 辅助数据生成函数 ----
+def _sample_device_facts() -> list[dict[str, Any]]:
+    """两天行为事实：其中 3 台设备两天都访问，用于验证跨日去重。
+
+    2026-11-01 有 8 台独立设备，2026-11-02 有 7 台，其中两台日共用 3 台，
+    因此两天合计应为 12 台；日值相加得到 15，会把重访设备多计 3 台。
+    """
+    day_one = ["d01", "d02", "d03", "d04", "d05", "d06", "d07", "d08"]
+    day_two = ["d06", "d07", "d08", "d09", "d10", "d11", "d12"]
+    facts: list[dict[str, Any]] = []
+    for offset, device in enumerate(day_one):
+        facts.append({
+            "event_date": "2026-11-01",
+            "device_id": device,
+            "event_time": f"2026-11-01T{8 + offset % 10:02d}:00:00",
+            "event_name": "页面访问",
+        })
+        if offset % 2 == 0:  # 同日重复访问不增加设备数
+            facts.append({
+                "event_date": "2026-11-01",
+                "device_id": device,
+                "event_time": f"2026-11-01T{18 + offset % 4:02d}:30:00",
+                "event_name": "页面访问",
+            })
+    for offset, device in enumerate(day_two):
+        facts.append({
+            "event_date": "2026-11-02",
+            "device_id": device,
+            "event_time": f"2026-11-02T{9 + offset % 9:02d}:00:00",
+            "event_name": "页面访问",
+        })
+    return facts
+
+
 def _sample_behavior_data() -> list[dict[str, Any]]:
     return [
         {"user_id": "u1", "event_name": "页面访问", "event_time": 1698768000 + i * 3600,

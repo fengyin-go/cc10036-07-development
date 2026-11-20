@@ -102,6 +102,299 @@ def generate_dimension_combinations(dimensions: list[str]) -> list[list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# 带来源粒度的可比聚合（跨日去重设备数）
+# ---------------------------------------------------------------------------
+#
+# 日级聚合只保存"当日去重设备数"这一个计数，直接把多天的计数相加会把
+# 跨日访问的同一设备重复计入。为了在多日查询里给出真实覆盖的独立设备数，
+# 立方需要保留一份带来源粒度的可比聚合产物：按日保存去重后的设备标识，
+# 范围查询再对这些标识做并集去重。标识产物受立方容量上限约束，一旦截断，
+# 该分区就只能提供计数、不能再参与精确并集，范围结果必须标记为非精确。
+
+DAY_GRAIN = "DAY"
+HOUR_GRAIN = "HOUR"
+
+_GRAIN_TOKENS: tuple[tuple[str, str], ...] = (
+    ("按日", DAY_GRAIN),
+    ("日级", DAY_GRAIN),
+    ("日粒度", DAY_GRAIN),
+    ("每日", DAY_GRAIN),
+    ("daily", DAY_GRAIN),
+    ("day", DAY_GRAIN),
+    ("按小时", HOUR_GRAIN),
+    ("小时级", HOUR_GRAIN),
+    ("hourly", HOUR_GRAIN),
+    ("hour", HOUR_GRAIN),
+)
+
+
+def resolve_grain_id(label: Any) -> str | None:
+    """把中文粒度描述解析成稳定的粒度标识（指标定义与立方共用）。"""
+    text = str(label or "").strip().casefold()
+    if not text:
+        return None
+    for token, grain_id in _GRAIN_TOKENS:
+        if token in text:
+            return grain_id
+    return None
+
+
+def normalize_date(value: Any) -> str | None:
+    """把日期/时间戳收敛为 YYYY-MM-DD；无法识别时返回 None。"""
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    candidate = text.replace("/", "-").split("T")[0].split(" ")[0][:10]
+    try:
+        import datetime
+        datetime.date.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
+def enumerate_dates(start_date: Any, end_date: Any, max_days: int = 366) -> list[str]:
+    """生成闭区间内的全部日期；非法或倒序时抛 ValueError。"""
+    import datetime
+
+    start = normalize_date(start_date)
+    end = normalize_date(end_date)
+    if start is None or end is None:
+        raise ValueError("日期格式必须是 YYYY-MM-DD")
+    if start > end:
+        raise ValueError("开始日期不能晚于结束日期")
+    begin = datetime.date.fromisoformat(start)
+    finish = datetime.date.fromisoformat(end)
+    span = (finish - begin).days + 1
+    if span > max_days:
+        raise ValueError(f"查询跨度不能超过 {max_days} 天")
+    return [(begin + datetime.timedelta(days=offset)).isoformat() for offset in range(span)]
+
+
+@dataclass
+class ComparableDayAggregate:
+    """日粒度可比聚合：日计数 + 受容量约束的去重设备标识产物。
+
+    device_count 由完整事实分区扫描得到，因此即使在标识产物截断时，
+    单日值仍然是精确的；device_ids 则只保留容量上限以内的标识，用于跨日并集。
+    """
+    date: str
+    grain_id: str
+    device_count: int
+    row_count: int
+    device_ids: list[str]
+    capacity_limit: int
+    truncated: bool
+    source: str = "fact_partition"
+
+    @property
+    def artifact_size(self) -> int:
+        return len(self.device_ids)
+
+    def to_dict(self, include_ids: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "date": self.date,
+            "grain_id": self.grain_id,
+            "source_grain": "日粒度",
+            "source": self.source,
+            "device_count": self.device_count,
+            "row_count": self.row_count,
+            "capacity_limit": self.capacity_limit,
+            "artifact_size": self.artifact_size,
+            "artifact_truncated": self.truncated,
+        }
+        if include_ids:
+            payload["device_ids"] = list(self.device_ids)
+        return payload
+
+
+def build_comparable_day_aggregates(
+    facts: list[dict[str, Any]],
+    *,
+    capacity_limit: int = 1000,
+    grain_id: str = DAY_GRAIN,
+    date_field: str = "event_date",
+    device_field: str = "device_id",
+    source: str = "fact_partition",
+) -> dict[str, ComparableDayAggregate]:
+    """从事实行构建日粒度可比聚合；同一设备多行只保留一个标识。"""
+    if capacity_limit <= 0:
+        raise ValueError("立方容量上限必须为正数")
+
+    device_rows: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for row in facts:
+        date = normalize_date(row.get(date_field))
+        device = str(row.get(device_field) or "").strip()
+        if date is None or not device:
+            continue
+        device_rows[date][device] += 1
+
+    aggregates: dict[str, ComparableDayAggregate] = {}
+    for date in sorted(device_rows):
+        rows_by_device = device_rows[date]
+        device_ids = sorted(rows_by_device)
+        stored_ids = device_ids[:capacity_limit]
+        aggregates[date] = ComparableDayAggregate(
+            date=date,
+            grain_id=grain_id,
+            device_count=len(device_ids),
+            row_count=sum(rows_by_device.values()),
+            device_ids=stored_ids,
+            capacity_limit=capacity_limit,
+            truncated=len(device_ids) > capacity_limit,
+            source=source,
+        )
+    return aggregates
+
+
+@dataclass
+class DeviceMergeResult:
+    """跨日设备并集结果；exact=False 时 value 必须保持为空，不能发布。"""
+    exact: bool
+    value: int | None
+    sum_of_days: int
+    lower_bound: int
+    overlap_devices: int | None
+    covered_dates: list[str]
+    missing_dates: list[str]
+    truncated_dates: list[str]
+    contributions: list[dict[str, Any]]
+    reasons: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exact": self.exact,
+            "value": self.value,
+            "sum_of_days": self.sum_of_days,
+            "sum_of_days_is_exact": False,
+            "additive": False,
+            "lower_bound": self.lower_bound,
+            "overlap_devices": self.overlap_devices,
+            "covered_dates": list(self.covered_dates),
+            "missing_dates": list(self.missing_dates),
+            "truncated_dates": list(self.truncated_dates),
+            "contributions": [dict(item) for item in self.contributions],
+            "reasons": list(self.reasons),
+        }
+
+
+def merge_comparable_aggregates(
+    aggregates: dict[str, ComparableDayAggregate],
+    dates: list[str],
+    *,
+    grain_id: str = DAY_GRAIN,
+) -> DeviceMergeResult:
+    """核对各日分区的贡献并做跨日设备并集；不满足精确条件时拒绝给值。"""
+    covered = [date for date in dates if date in aggregates]
+    missing = [date for date in dates if date not in aggregates]
+    truncated = [date for date in covered if aggregates[date].truncated]
+
+    sum_of_days = sum(aggregates[date].device_count for date in covered)
+    device_hits: dict[str, int] = defaultdict(int)
+    for date in covered:
+        for device in aggregates[date].device_ids:
+            device_hits[device] += 1
+    union_of_artifacts = len(device_hits)
+
+    day_max = max((aggregates[date].device_count for date in covered), default=0)
+    # 截断分区的真实并集只会比已存标识更多，因此已存并集是可靠下界。
+    lower_bound = max(union_of_artifacts, day_max)
+
+    reasons: list[str] = []
+    if not dates:
+        reasons.append("未指定查询日期")
+    if missing:
+        reasons.append(f"事实分区缺失：{', '.join(missing)}，范围不完整")
+    if truncated:
+        reasons.append(
+            f"精确去重产物超出立方容量上限：{', '.join(truncated)}，"
+            "无法完成跨日精确并集"
+        )
+
+    exact = bool(dates) and not missing and not truncated
+    value = union_of_artifacts if exact else None
+    overlap = (sum_of_days - value) if exact and value is not None else None
+
+    contributions: list[dict[str, Any]] = []
+    for date in dates:
+        aggregate = aggregates.get(date)
+        if aggregate is None:
+            contributions.append({
+                "date": date,
+                "available": False,
+                "source": None,
+                "grain_id": grain_id,
+                "day_value": None,
+                "artifact_size": 0,
+                "unique_to_day": None,
+                "shared_with_other_days": None,
+            })
+            continue
+        unique_to_day = sum(
+            1 for device in aggregate.device_ids if device_hits.get(device, 0) == 1
+        )
+        contributions.append({
+            "date": date,
+            "available": True,
+            "source": aggregate.source,
+            "grain_id": aggregate.grain_id,
+            "day_value": aggregate.device_count,
+            "row_count": aggregate.row_count,
+            "artifact_size": aggregate.artifact_size,
+            "artifact_truncated": aggregate.truncated,
+            "unique_to_day": unique_to_day,
+            "shared_with_other_days": aggregate.artifact_size - unique_to_day,
+        })
+
+    return DeviceMergeResult(
+        exact=exact,
+        value=value,
+        sum_of_days=sum_of_days,
+        lower_bound=lower_bound,
+        overlap_devices=overlap,
+        covered_dates=covered,
+        missing_dates=missing,
+        truncated_dates=truncated,
+        contributions=contributions,
+        reasons=reasons,
+    )
+
+
+def build_fact_coverage(
+    requested_dates: list[str],
+    available_dates: list[str],
+    fact_partitions: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """记录请求范围与当前可用事实/可比聚合来源的覆盖关系。"""
+    fact_partitions = fact_partitions or {}
+    available = set(available_dates)
+    sources = [
+        {
+            "date": date,
+            "available": date in available,
+            "fact_rows": fact_partitions.get(date, 0),
+            "source": "fact_partition" if date in available else None,
+        }
+        for date in requested_dates
+    ]
+    missing = [date for date in requested_dates if date not in available]
+    return {
+        "requested_dates": list(requested_dates),
+        "available_dates": [date for date in requested_dates if date in available],
+        "missing_dates": missing,
+        "complete": bool(requested_dates) and not missing,
+        "sources": sources,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 分群条件解析
 # ---------------------------------------------------------------------------
 
